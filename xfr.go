@@ -1,195 +1,244 @@
 package dns
 
-// XfrToken is used when doing [IA]xfr with a remote server.
-type XfrToken struct {
-	RR    []RR  // the set of RRs in the answer section of the AXFR reply message 
-	Error error // if something went wrong, this contains the error  
+import (
+	"time"
+)
+
+// Envelope is used when doing a zone transfer with a remote server.
+type Envelope struct {
+	RR    []RR  // The set of RRs in the answer section of the xfr reply message.
+	Error error // If something went wrong, this contains the error.
 }
 
-// XfrReceive performs a [AI]xfr request (depends on the message's Qtype). It returns
-// a channel of XfrToken on which the replies from the server are sent. At the end of
-// the transfer the channel is closed.
-// It panics if the Qtype does not equal TypeAXFR or TypeIXFR. The messages are TSIG checked if
-// needed, no other post-processing is performed. The caller must dissect the returned
-// messages.
-//
-// Basic use pattern for receiving an AXFR:
-//
-//	// m contains the AXFR request
-//	t, e := client.XfrReceive(m, "127.0.0.1:53")
-//	for r := range t {
-//		// ... deal with r.RR or r.Error
-//	}
-func (c *Client) XfrReceive(q *Msg, a string) (chan *XfrToken, error) {
-	w := new(reply)
-	w.client = c
-	w.addr = a
-	w.req = q
-	if err := w.dial(); err != nil {
-		return nil, err
-	}
-	if err := w.send(q); err != nil {
-		return nil, err
-	}
-	e := make(chan *XfrToken)
-	switch q.Question[0].Qtype {
-	case TypeAXFR:
-		go w.axfrReceive(q, e)
-		return e, nil
-	case TypeIXFR:
-		go w.ixfrReceive(q, e)
-		return e, nil
-	default:
-		return nil, ErrXfrType
-	}
-	panic("dns: not reached")
+// A Transfer defines parameters that are used during a zone transfer.
+type Transfer struct {
+	*Conn
+	DialTimeout    time.Duration     // net.DialTimeout, defaults to 2 seconds
+	ReadTimeout    time.Duration     // net.Conn.SetReadTimeout value for connections, defaults to 2 seconds
+	WriteTimeout   time.Duration     // net.Conn.SetWriteTimeout value for connections, defaults to 2 seconds
+	TsigSecret     map[string]string // Secret(s) for Tsig map[<zonename>]<base64 secret>, zonename must be fully qualified
+	tsigTimersOnly bool
 }
 
-func (w *reply) axfrReceive(q *Msg, c chan *XfrToken) {
-	first := true
-	defer w.conn.Close()
-	defer close(c)
-	for {
-		in, err := w.receive()
+// Think we need to away to stop the transfer
+
+// In performs an incoming transfer with the server in a.
+// If you would like to set the source IP, or some other attribute
+// of a Dialer for a Transfer, you can do so by specifying the attributes
+// in the Transfer.Conn:
+//
+//	d := net.Dialer{LocalAddr: transfer_source}
+//	con, err := d.Dial("tcp", master)
+//	dnscon := &dns.Conn{Conn:con}
+//	transfer = &dns.Transfer{Conn: dnscon}
+//	channel, err := transfer.In(message, master)
+//
+func (t *Transfer) In(q *Msg, a string) (env chan *Envelope, err error) {
+	timeout := dnsTimeout
+	if t.DialTimeout != 0 {
+		timeout = t.DialTimeout
+	}
+	if t.Conn == nil {
+		t.Conn, err = DialTimeout("tcp", a, timeout)
 		if err != nil {
-			c <- &XfrToken{nil, err}
+			return nil, err
+		}
+	}
+	if err := t.WriteMsg(q); err != nil {
+		return nil, err
+	}
+	env = make(chan *Envelope)
+	go func() {
+		if q.Question[0].Qtype == TypeAXFR {
+			go t.inAxfr(q.Id, env)
 			return
 		}
-		if in.Id != q.Id {
-			c <- &XfrToken{in.Answer, ErrId}
+		if q.Question[0].Qtype == TypeIXFR {
+			go t.inIxfr(q.Id, env)
+			return
+		}
+	}()
+	return env, nil
+}
+
+func (t *Transfer) inAxfr(id uint16, c chan *Envelope) {
+	first := true
+	defer t.Close()
+	defer close(c)
+	timeout := dnsTimeout
+	if t.ReadTimeout != 0 {
+		timeout = t.ReadTimeout
+	}
+	for {
+		t.Conn.SetReadDeadline(time.Now().Add(timeout))
+		in, err := t.ReadMsg()
+		if err != nil {
+			c <- &Envelope{nil, err}
+			return
+		}
+		if id != in.Id {
+			c <- &Envelope{in.Answer, ErrId}
 			return
 		}
 		if first {
-			if !checkXfrSOA(in, true) {
-				c <- &XfrToken{in.Answer, ErrXfrSoa}
+			if !isSOAFirst(in) {
+				c <- &Envelope{in.Answer, ErrSoa}
 				return
 			}
 			first = !first
+			// only one answer that is SOA, receive more
+			if len(in.Answer) == 1 {
+				t.tsigTimersOnly = true
+				c <- &Envelope{in.Answer, nil}
+				continue
+			}
 		}
 
 		if !first {
-			w.tsigTimersOnly = true // Subsequent envelopes use this.
-			if checkXfrSOA(in, false) {
-				c <- &XfrToken{in.Answer, nil}
+			t.tsigTimersOnly = true // Subsequent envelopes use this.
+			if isSOALast(in) {
+				c <- &Envelope{in.Answer, nil}
 				return
 			}
-			c <- &XfrToken{in.Answer, nil}
+			c <- &Envelope{in.Answer, nil}
 		}
 	}
-	panic("dns: not reached")
 }
 
-func (w *reply) ixfrReceive(q *Msg, c chan *XfrToken) {
-	var serial uint32 // The first serial seen is the current server serial
+func (t *Transfer) inIxfr(id uint16, c chan *Envelope) {
+	serial := uint32(0) // The first serial seen is the current server serial
 	first := true
-	defer w.conn.Close()
+	defer t.Close()
 	defer close(c)
+	timeout := dnsTimeout
+	if t.ReadTimeout != 0 {
+		timeout = t.ReadTimeout
+	}
 	for {
-		in, err := w.receive()
+		t.SetReadDeadline(time.Now().Add(timeout))
+		in, err := t.ReadMsg()
 		if err != nil {
-			c <- &XfrToken{in.Answer, err}
+			c <- &Envelope{nil, err}
 			return
 		}
-		if q.Id != in.Id {
-			c <- &XfrToken{in.Answer, ErrId}
+		if id != in.Id {
+			c <- &Envelope{in.Answer, ErrId}
 			return
 		}
 		if first {
 			// A single SOA RR signals "no changes"
-			if len(in.Answer) == 1 && checkXfrSOA(in, true) {
-				c <- &XfrToken{in.Answer, nil}
+			if len(in.Answer) == 1 && isSOAFirst(in) {
+				c <- &Envelope{in.Answer, nil}
 				return
 			}
 
 			// Check if the returned answer is ok
-			if !checkXfrSOA(in, true) {
-				c <- &XfrToken{in.Answer, ErrXfrSoa}
+			if !isSOAFirst(in) {
+				c <- &Envelope{in.Answer, ErrSoa}
 				return
 			}
 			// This serial is important
-			serial = in.Answer[0].(*RR_SOA).Serial
+			serial = in.Answer[0].(*SOA).Serial
 			first = !first
 		}
 
 		// Now we need to check each message for SOA records, to see what we need to do
 		if !first {
-			w.tsigTimersOnly = true
+			t.tsigTimersOnly = true
 			// If the last record in the IXFR contains the servers' SOA,  we should quit
-			if v, ok := in.Answer[len(in.Answer)-1].(*RR_SOA); ok {
+			if v, ok := in.Answer[len(in.Answer)-1].(*SOA); ok {
 				if v.Serial == serial {
-					c <- &XfrToken{in.Answer, nil}
+					c <- &Envelope{in.Answer, nil}
 					return
 				}
 			}
-			c <- &XfrToken{in.Answer, nil}
+			c <- &Envelope{in.Answer, nil}
 		}
 	}
-	panic("dns: not reached")
 }
 
-// Check if he SOA record exists in the Answer section of 
-// the packet. If first is true the first RR must be a SOA
-// if false, the last one should be a SOA.
-func checkXfrSOA(in *Msg, first bool) bool {
-	if len(in.Answer) > 0 {
-		if first {
-			return in.Answer[0].Header().Rrtype == TypeSOA
-		} else {
-			return in.Answer[len(in.Answer)-1].Header().Rrtype == TypeSOA
+// Out performs an outgoing transfer with the client connecting in w.
+// Basic use pattern:
+//
+//	ch := make(chan *dns.Envelope)
+//	tr := new(dns.Transfer)
+//	go tr.Out(w, r, ch)
+//	ch <- &dns.Envelope{RR: []dns.RR{soa, rr1, rr2, rr3, soa}}
+//	close(ch)
+//	w.Hijack()
+//	// w.Close() // Client closes connection
+//
+// The server is responsible for sending the correct sequence of RRs through the
+// channel ch.
+func (t *Transfer) Out(w ResponseWriter, q *Msg, ch chan *Envelope) error {
+	for x := range ch {
+		r := new(Msg)
+		// Compress?
+		r.SetReply(q)
+		r.Authoritative = true
+		// assume it fits TODO(miek): fix
+		r.Answer = append(r.Answer, x.RR...)
+		if err := w.WriteMsg(r); err != nil {
+			return err
 		}
+	}
+	w.TsigTimersOnly(true)
+	return nil
+}
+
+// ReadMsg reads a message from the transfer connection t.
+func (t *Transfer) ReadMsg() (*Msg, error) {
+	m := new(Msg)
+	p := make([]byte, MaxMsgSize)
+	n, err := t.Read(p)
+	if err != nil && n == 0 {
+		return nil, err
+	}
+	p = p[:n]
+	if err := m.Unpack(p); err != nil {
+		return nil, err
+	}
+	if ts := m.IsTsig(); ts != nil && t.TsigSecret != nil {
+		if _, ok := t.TsigSecret[ts.Hdr.Name]; !ok {
+			return m, ErrSecret
+		}
+		// Need to work on the original message p, as that was used to calculate the tsig.
+		err = TsigVerify(p, t.TsigSecret[ts.Hdr.Name], t.tsigRequestMAC, t.tsigTimersOnly)
+		t.tsigRequestMAC = ts.MAC
+	}
+	return m, err
+}
+
+// WriteMsg writes a message through the transfer connection t.
+func (t *Transfer) WriteMsg(m *Msg) (err error) {
+	var out []byte
+	if ts := m.IsTsig(); ts != nil && t.TsigSecret != nil {
+		if _, ok := t.TsigSecret[ts.Hdr.Name]; !ok {
+			return ErrSecret
+		}
+		out, t.tsigRequestMAC, err = TsigGenerate(m, t.TsigSecret[ts.Hdr.Name], t.tsigRequestMAC, t.tsigTimersOnly)
+	} else {
+		out, err = m.Pack()
+	}
+	if err != nil {
+		return err
+	}
+	if _, err = t.Write(out); err != nil {
+		return err
+	}
+	return nil
+}
+
+func isSOAFirst(in *Msg) bool {
+	if len(in.Answer) > 0 {
+		return in.Answer[0].Header().Rrtype == TypeSOA
 	}
 	return false
 }
 
-
-
-// XfrSend performs an outgoing [AI]xfr depending on the request message. The
-// caller is responsible for sending the correct sequence of RR sets through
-// the channel c. For reasons of symmetry XfrToken is re-used.
-// Errors are signaled via the error pointer, when an error occurs the function
-// sets the error and returns (it does not close the channel).
-// TSIG and enveloping is handled by XfrSend.
-// 
-// Basic use pattern for sending an AXFR:
-//
-//	// q contains the AXFR request
-//	c := make(chan *XfrToken)
-//	var e *error
-//	err := XfrSend(w, q, c, e)
-//	w.Hijack()		// hijack the connection so that the library doesn't close it
-//	for _, rrset := range rrsets {	// rrset is a []RR
-//		c <- &{XfrToken{RR: rrset}
-//		if e != nil {
-//			close(c)
-//			break
-//		}
-//	}
-//	// w.Close() // Don't! Let the client close the connection
-func XfrSend(w ResponseWriter, q *Msg, c chan *XfrToken, e *error) error {
-	switch q.Question[0].Qtype {
-	case TypeAXFR, TypeIXFR:
-		go axfrSend(w, q, c, e)
-		return nil
-	default:
-		return ErrXfrType
+func isSOALast(in *Msg) bool {
+	if len(in.Answer) > 0 {
+		return in.Answer[len(in.Answer)-1].Header().Rrtype == TypeSOA
 	}
-	panic("not reached")
-}
-
-// TODO(mg): count the RRs and the resulting size.
-func axfrSend(w ResponseWriter, req *Msg, c chan *XfrToken, e *error) {
-	rep := new(Msg)
-	rep.SetReply(req)
-	rep.Authoritative = true
-
-	for x := range c {
-		// assume it fits
-		rep.Answer = append(rep.Answer, x.RR...)
-		if err := w.Write(rep); e != nil {
-			*e = err
-			return
-		}
-		w.TsigTimersOnly(true)
-		rep.Answer = nil
-	}
+	return false
 }

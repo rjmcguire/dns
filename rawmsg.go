@@ -1,56 +1,6 @@
-// Copyright 2012 Miek Gieben. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
-
 package dns
 
-// These raw* functions do not use reflection, they directly set the values
-// in the buffer. There are faster than their reflection counterparts.
-
-// RawSetId sets the message id in buf.
-func rawSetId(msg []byte, i uint16) bool {
-	if len(msg) < 2 {
-		return false
-	}
-	msg[0], msg[1] = packUint16(i)
-	return true
-}
-
-// rawSetQuestionLen sets the lenght of the question section.
-func rawSetQuestionLen(msg []byte, i uint16) bool {
-	if len(msg) < 6 {
-		return false
-	}
-	msg[4], msg[5] = packUint16(i)
-	return true
-}
-
-// rawSetAnswerLen sets the lenght of the answer section.
-func rawSetAnswerLen(msg []byte, i uint16) bool {
-	if len(msg) < 8 {
-		return false
-	}
-	msg[6], msg[7] = packUint16(i)
-	return true
-}
-
-// rawSetsNsLen sets the lenght of the authority section.
-func rawSetNsLen(msg []byte, i uint16) bool {
-	if len(msg) < 10 {
-		return false
-	}
-	msg[8], msg[9] = packUint16(i)
-	return true
-}
-
-// rawSetExtraLen sets the lenght of the additional section.
-func rawSetExtraLen(msg []byte, i uint16) bool {
-	if len(msg) < 12 {
-		return false
-	}
-	msg[10], msg[11] = packUint16(i)
-	return true
-}
+import "encoding/binary"
 
 // rawSetRdlength sets the rdlength in the header of
 // the RR. The offset 'off' must be positioned at the
@@ -71,6 +21,10 @@ Loop:
 				// End of the domainname
 				break Loop
 			}
+			if off+c > l {
+				return false
+			}
+			off += c
 
 		case 0xC0:
 			// pointer, next byte included, ends domainname
@@ -85,7 +39,11 @@ Loop:
 		return false
 	}
 	//off+1 is the end of the header, 'end' is the end of the rr
-	//so 'end' - 'off+2' is the lenght of the rdata
-	msg[off], msg[off+1] = packUint16(uint16(end - (off + 2)))
+	//so 'end' - 'off+2' is the length of the rdata
+	rdatalen := end - (off + 2)
+	if rdatalen > 0xFFFF {
+		return false
+	}
+	binary.BigEndian.PutUint16(msg[off:], uint16(rdatalen))
 	return true
 }
